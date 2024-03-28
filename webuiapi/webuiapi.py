@@ -1,13 +1,16 @@
 import json
-
 import PIL
 import requests
+from requests.models import Response
 import io
 import base64
 from PIL import Image, PngImagePlugin
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Dict, Any, Optional, Union ,Literal
+import aiohttp
+import asyncio
+from aiohttp import ClientSession, ClientTimeout, ClientResponseError, BasicAuth, ClientError
 
 
 class Upscaler(str, Enum):
@@ -400,112 +403,138 @@ class WebUIApi:
     has_controlnet = False
     has_adetailer = False
 
-    def __init__(
-        self,
-        host="127.0.0.1",
-        port=7860,
-        baseurl=None,
-        sampler="Euler a",
-        steps=20,
-        use_https=False,
-        username=None,
-        password=None,
-    ):
-        if baseurl is None:
-            if use_https:
-                baseurl = f"https://{host}:{port}/sdapi/v1"
+    def __init__(self, host="127.0.0.1", port=7860, baseurl=None, sampler="Euler a", steps=20, use_https=False, username=None, password=None):
+        # Validate host and port
+        if not isinstance(host, str):
+            raise ValueError("Host must be a string.")
+        if not isinstance(port, int) or port <= 0 or port > 65535:
+            raise ValueError("Port must be an integer between 1 and 65535.")
+        
+        try:
+            if baseurl is None:
+                baseurl = f"http{'s' if use_https else ''}://{host}:{port}/sdapi/v1"
+            self.baseurl = baseurl
+            self.default_sampler = sampler
+            self.default_steps = steps
+            self.session = requests.Session()
+            if username and password:
+                self.set_auth(username, password)
             else:
-                baseurl = f"http://{host}:{port}/sdapi/v1"
-
-        self.baseurl = baseurl
-        self.default_sampler = sampler
-        self.default_steps = steps
-
-        self.session = requests.Session()
-
-        if username and password:
-            self.set_auth(username, password)
-        else:
-            self.check_extensions()
+                self.check_extensions()
+        except Exception as e:
+            raise ConnectionError(f"Failed to initialize WebUIApi with error: {e}")
 
 
     def check_extensions(self):
-        self.check_controlnet()
-        self.check_adetailer()
+        try:
+            self.check_controlnet()
+            self.check_adetailer()
+        except Exception as e:
+            print(f"Error checking extensions: {e}")
 
     def check_controlnet(self):
         try:
             scripts = self.get_scripts()
-            self.has_controlnet = "controlnet m2m" in scripts["txt2img"]
-        except:
-            pass
+            self.has_controlnet = "controlnet m2m" in scripts.get("txt2img", [])
+        except Exception as e:
+            print(f"An unexpected error occurred while checking for ControlNet: {e}")
 
     def check_adetailer(self):
         try:
             scripts = self.get_scripts()
-            self.has_adetailer = "adetailer" in scripts["txt2img"]
-        except:
-            pass
+            self.has_adetailer = "adetailer" in scripts.get("txt2img", [])
+        except Exception as e:
+            print(f"An unexpected error occurred while checking for ADetailer: {e}")
 
     def set_auth(self, username, password):
-        self.session.auth = (username, password)
-        self.check_extensions()
+        if not username or not password:
+            raise ValueError("Username and password are required for authentication.")
+        
+        try:
+            self.session.auth = (username, password)
+            self.check_extensions()
+        except Exception as e:
+            raise RuntimeError(f"Failed to set authentication with error: {e}")
 
-    def _to_api_result(self, response):
-        if response.status_code != 200:
-            raise RuntimeError(response.status_code, response.text)
+    def _to_api_result(self, response: Response):
+        try:
+            response.raise_for_status()  # Raises stored HTTPError, if one occurred.
+            
+            r = response.json()
+            images, info, parameters = self._parse_response_content(r)
+            
+            return WebUIApiResult(images, parameters, info, r)
+        except requests.HTTPError as e:
+            raise RuntimeError(f"HTTP error: {e.response.status_code} {e.response.text}")
+        except json.JSONDecodeError:
+            raise ValueError("Failed to parse JSON response.")
+        except KeyError as e:
+            raise KeyError(f"Missing expected key in response: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error processing API response: {e}")
 
-        r = response.json()
+    def _parse_response_content(self, response_content):
+        # This method is a refactored part to handle the parsing logic separately
         images = []
-        if "images" in r.keys():
-            images = [Image.open(io.BytesIO(base64.b64decode(i))) for i in r["images"]]
-        elif "image" in r.keys():
-            images = [Image.open(io.BytesIO(base64.b64decode(r["image"])))]
-
-        info = ""
-        if "info" in r.keys():
+        if "images" in response_content:
+            images = [Image.open(io.BytesIO(base64.b64decode(i))) for i in response_content["images"]]
+        elif "image" in response_content:
+            images = [Image.open(io.BytesIO(base64.b64decode(response_content["image"])))]
+        
+        info = response_content.get("info", "")
+        if not isinstance(info, dict):
             try:
-                info = json.loads(r["info"])
+                info = json.loads(info)
             except:
-                info = r["info"]
-        elif "html_info" in r.keys():
-            info = r["html_info"]
-        elif "caption" in r.keys():
-            info = r["caption"]
+                pass  # keep info as is if it cannot be converted
+        
+        parameters = response_content.get("parameters", "")
+        
+        return images, parameters, info
 
-        parameters = ""
-        if "parameters" in r.keys():
-            parameters = r["parameters"]
-
-        return WebUIApiResult(images, parameters, info, r)
-
+    async def async_post(self, url, json):
+        try:
+            async with ClientSession() as session:
+                auth = aiohttp.BasicAuth(self.session.auth[0], self.session.auth[1]) if self.session.auth else None
+                async with session.post(url, json=json, auth=auth) as response:
+                    if response.status != 200:
+                        # Capture non-200 responses and raise with detailed information
+                        error_text = await response.text()
+                        raise RuntimeError(f"HTTP error {response.status}: {error_text}")
+                    return await self._to_api_result_async(response)
+        except Exception as e:
+            # Catch-all for any other exceptions
+            raise RuntimeError(f"Unexpected error during async POST request: {e}")
+    
     async def _to_api_result_async(self, response):
-        if response.status != 200:
-            raise RuntimeError(response.status, await response.text())
+        try:
+            r = await response.json()
+            images = []
+            if "images" in r:
+                images = [Image.open(io.BytesIO(base64.b64decode(i))) for i in r["images"]]
+            elif "image" in r:
+                images = [Image.open(io.BytesIO(base64.b64decode(r["image"])))]
 
-        r = await response.json()
-        images = []
-        if "images" in r.keys():
-            images = [Image.open(io.BytesIO(base64.b64decode(i))) for i in r["images"]]
-        elif "image" in r.keys():
-            images = [Image.open(io.BytesIO(base64.b64decode(r["image"])))]
+            info = r.get("info", "")
+            if not isinstance(info, str):
+                info = json.dumps(info)  # Ensure info is always a string for consistency
 
-        info = ""
-        if "info" in r.keys():
-            try:
-                info = json.loads(r["info"])
-            except:
-                info = r["info"]
-        elif "html_info" in r.keys():
-            info = r["html_info"]
-        elif "caption" in r.keys():
-            info = r["caption"]
+            parameters = r.get("parameters", "")
 
-        parameters = ""
-        if "parameters" in r.keys():
-            parameters = r["parameters"]
+            return WebUIApiResult(images, parameters, info, r)
+        except aiohttp.ContentTypeError:
+            # Handle issues with response content type, e.g., not JSON as expected
+            raise ValueError("Response content type error, expected JSON.")
+        except json.JSONDecodeError:
+            # Handle errors in decoding JSON
+            raise ValueError("Error decoding JSON from response.")
+        except KeyError as e:
+            # Handle missing keys in JSON
+            raise KeyError(f"Missing expected key in response JSON: {e}")
+        except Exception as e:
+            # Catch-all for any other exceptions
+            raise RuntimeError(f"Unexpected error processing async API response: {e}")
 
-        return WebUIApiResult(images, parameters, info, r)
 
     def txt2img(
         self,
@@ -566,6 +595,12 @@ class WebUIApi:
             steps = self.default_steps
         if script_args is None:
             script_args = []
+        
+        if not prompt:
+            raise ValueError("Prompt cannot be empty.")
+        if width <= 0 or height <= 0:
+            print("Width and height must be positive integers.")
+        
         payload = {
             "enable_hr": enable_hr,
             "hr_scale": hr_scale,
@@ -652,9 +687,45 @@ class WebUIApi:
             # workaround : if not passed, webui will use previous args!
             payload["alwayson_scripts"]["ControlNet"] = {"args": []}
 
-        return self.post_and_get_api_result(
-            f"{self.baseurl}/txt2img", payload, use_async
-        )
+        try:
+            response = self.session.post(f"{self.baseurl}/txt2img", json=payload)
+            response.raise_for_status()  # Raises a HTTPError for bad responses
+
+            # Assuming the response is JSON with expected keys
+            data = response.json()
+            if "images" not in data or "info" not in data:
+                raise KeyError("Response JSON is missing expected keys: 'images', 'info'.")
+
+            # Process and return the response as needed
+            return data
+
+        except requests.exceptions.HTTPError as http_err:
+            # Specific handling for HTTP errors
+            raise SystemError(f"HTTP error occurred: {http_err}") from http_err
+
+        except requests.exceptions.ConnectionError as conn_err:
+            # Specific handling for Connection errors
+            raise SystemError(f"Connection error occurred: {conn_err}") from conn_err
+
+        except requests.exceptions.Timeout as timeout_err:
+            # Specific handling for Timeout errors
+            raise SystemError(f"Timeout occurred: {timeout_err}") from timeout_err
+
+        except requests.exceptions.RequestException as req_err:
+            # Catch-all for other request-related errors
+            raise SystemError(f"Error during requests to the API: {req_err}") from req_err
+
+        except KeyError as key_err:
+            # Handling missing keys in response data
+            raise ValueError(f"Missing key in response data: {key_err}") from key_err
+
+        except ValueError as val_err:
+            # Handling JSON decoding errors (e.g., response is not JSON)
+            raise ValueError(f"Error decoding response JSON: {val_err}") from val_err
+
+        except Exception as e:
+            # General catch-all for unexpected errors
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def post_and_get_api_result(self, url, json, use_async):
         if use_async:
@@ -662,17 +733,54 @@ class WebUIApi:
 
             return asyncio.ensure_future(self.async_post(url=url, json=json))
         else:
-            response = self.session.post(url=url, json=json)
-            return self._to_api_result(response)
+            try:
+                response = self.session.post(url=url, json=json)
+                response.raise_for_status()  # Check for HTTP errors
+                return self._to_api_rsesult(response)
+            except requests.HTTPError as http_err:
+                # Handle HTTP errors
+                raise SystemError(f"HTTP error occurred: {http_err}") from http_err
+            except requests.RequestException as req_err:
+                # Handle other requests-related errors
+                raise SystemError(f"Request error occurred: {req_err}") from req_err
+            except Exception as e:
+                # Handle unexpected errors
+                raise SystemError(f"An unexpected error occurred: {e}") from e
 
     async def async_post(self, url, json):
-        import aiohttp
+        """Asynchronously make a POST request and process the API result with enhanced error handling."""
+        infinite_timeout = ClientTimeout(total=None)
+        auth = BasicAuth(self.session.auth[0], self.session.auth[1]) if self.session.auth else None
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout()) as session:
-            infinite_timeout = aiohttp.ClientTimeout(total=None)
-            auth = aiohttp.BasicAuth(self.session.auth[0], self.session.auth[1]) if self.session.auth else None
-            async with session.post(url, json=json, auth=auth, timeout=infinite_timeout) as response: # infinite_timeout timeout here for timeout fix
-                return await self._to_api_result_async(response)
+        try:
+            async with ClientSession(timeout=ClientTimeout()) as session:
+                async with session.post(url, json=json, auth=auth, timeout=infinite_timeout) as response:
+                    response.raise_for_status()  # Check for HTTP errors
+                    return await self._to_api_result_async(response)
+
+        except aiohttp.ClientResponseError as e:
+            # Handle client response errors (e.g., 404 Not Found, 403 Forbidden)
+            raise SystemError(f"Client response error occurred: {e.status} - {e.message}") from e
+
+        except aiohttp.ClientConnectionError as e:
+            # Handle client connection errors (e.g., DNS failure, refused connection)
+            raise SystemError("Client connection error occurred.") from e
+
+        except aiohttp.ClientPayloadError as e:
+            # Handle payload errors (e.g., malformed response payload)
+            raise SystemError("Client payload error occurred.") from e
+
+        except aiohttp.ClientError as e:
+            # Catch-all for all other aiohttp client exceptions
+            raise SystemError(f"An unexpected aiohttp client error occurred: {e}") from e
+
+        except asyncio.TimeoutError as e:
+            # Handle timeout specific errors
+            raise SystemError("Request timed out.") from e
+
+        except Exception as e:
+            # Handle any other unexpected errors
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def img2img(
         self,
@@ -921,13 +1029,24 @@ class WebUIApi:
 
     # XXX 500 error (2022/12/26)
     def png_info(self, image):
+        """Retrieve PNG metadata."""
         payload = {
-            "image": b64_img(image),
+            "image": self.b64_img(image),
         }
-
-        response = self.session.post(url=f"{self.baseurl}/png-info", json=payload)
-        return self._to_api_result(response)
-
+        try:
+            response = self.session.post(url=f"{self.baseurl}/png-info", json=payload)
+            response.raise_for_status()
+            return self._to_api_result(response)
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except requests.ConnectionError as e:
+            raise SystemError("Connection Error. Please check your network connection.") from e
+        except requests.Timeout as e:
+            raise SystemError("The request timed out. Please try again later.") from e
+        except requests.RequestException as e:
+            raise SystemError(f"An error occurred while handling your request: {e}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
     """
     :param image pass base64 encoded image or PIL Image
     :param model "clip" or "deepdanbooru"
@@ -938,12 +1057,36 @@ class WebUIApi:
             "model": model,
         }
 
-        response = self.session.post(url=f"{self.baseurl}/interrogate", json=payload)
-        return self._to_api_result(response)
+        try:
+            response = self.session.post(url=f"{self.baseurl}/interrogate", json=payload)
+            response.raise_for_status()
+            return self._to_api_result(response)
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except requests.ConnectionError as e:
+            raise SystemError("Connection Error. Please check your network connection.") from e
+        except requests.Timeout as e:
+            raise SystemError("The request timed out. Please try again later.") from e
+        except requests.RequestException as e:
+            raise SystemError(f"An error occurred while handling your request: {e}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
         
     def list_prompt_gen_models(self):
-        r = self.custom_get("promptgen/list_models")
-        return r['available_models']
+        """List available models for prompt generation."""
+        try:
+            response = self.custom_get("promptgen/list_models")
+            response.raise_for_status()  # Check for HTTP errors
+            data = response.json()
+            if 'available_models' not in data:
+                raise ValueError("Response JSON is missing the 'available_models' key.")
+            return data['available_models']
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except ValueError as e:
+            raise SystemError(f"Data format error: {e}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def prompt_gen(self, 
         model_name: str = "AUTOMATIC/promptgen-lexart",
@@ -976,208 +1119,430 @@ class WebUIApi:
             "top_p": top_p
         }
 
-        r = self.custom_post("promptgen/generate", payload=payload) 
-        return r.json['prompts']
+        try:
+            response = self.custom_post("promptgen/generate", payload=payload)
+            response.raise_for_status()  # Check for HTTP errors
+            data = response.json()
+            if 'prompts' not in data:
+                raise ValueError("Response JSON is missing the 'prompts' key.")
+            return data['prompts']
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except ValueError as e:
+            raise SystemError(f"Data format error: {e}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
     
     def interrupt(self):
-        response = self.session.post(url=f"{self.baseurl}/interrupt")
-        return response.json()
+        """Interrupt the current operation."""
+        try:
+            response = self.session.post(url=f"{self.baseurl}/interrupt")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def skip(self):
-        response = self.session.post(url=f"{self.baseurl}/skip")
-        return response.json()
+        """Skip the current operation."""
+        try:
+            response = self.session.post(url=f"{self.baseurl}/skip")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def get_options(self):
-        response = self.session.get(url=f"{self.baseurl}/options")
-        return response.json()
+        """Retrieve current options/settings."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/options")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def set_options(self, options):
-        response = self.session.post(url=f"{self.baseurl}/options", json=options)
-        return response.json()
+        """Set options/settings."""
+        try:
+            response = self.session.post(url=f"{self.baseurl}/options", json=options)
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def get_cmd_flags(self):
-        response = self.session.get(url=f"{self.baseurl}/cmd-flags")
-        return response.json()
+        """Retrieve command flags."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/cmd-flags")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
 
     def get_progress(self):
-        response = self.session.get(url=f"{self.baseurl}/progress")
-        return response.json()
-
-    def get_cmd_flags(self):
-        response = self.session.get(url=f"{self.baseurl}/cmd-flags")
-        return response.json()
-
+        """Retrieve progress information."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/progress")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred: {e}") from e
+    
     def get_samplers(self):
-        response = self.session.get(url=f"{self.baseurl}/samplers")
-        return response.json()
+        """Retrieve the list of available samplers."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/samplers")
+            response.raise_for_status()  # This will raise an exception for HTTP error responses
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching samplers: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching samplers: {e}") from e
 
     def get_sd_vae(self):
-        response = self.session.get(url=f"{self.baseurl}/sd-vae")
-        return response.json()
+        """Retrieve SD-VAE information."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/sd-vae")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching SD-VAE info: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching SD-VAE info: {e}") from e
 
     def get_upscalers(self):
-        response = self.session.get(url=f"{self.baseurl}/upscalers")
-        return response.json()
+        """Retrieve the list of available upscalers."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/upscalers")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching upscalers: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching upscalers: {e}") from e
 
     def get_latent_upscale_modes(self):
-        response = self.session.get(url=f"{self.baseurl}/latent-upscale-modes")
-        return response.json()
+        """Retrieve latent upscale modes."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/latent-upscale-modes")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching latent upscale modes: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching latent upscale modes: {e}") from e
 
     def get_loras(self):
-        response = self.session.get(url=f"{self.baseurl}/loras")
-        return response.json()
+        """Retrieve LORAs (List of Recent Artworks?)."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/loras")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching LORAs: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching LORAs: {e}") from e
 
     def get_sd_models(self):
-        response = self.session.get(url=f"{self.baseurl}/sd-models")
-        return response.json()
-
+        """Retrieve available SD models."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/sd-models")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching SD models: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching SD models: {e}") from e
+    
     def get_hypernetworks(self):
-        response = self.session.get(url=f"{self.baseurl}/hypernetworks")
-        return response.json()
+        """Retrieve hypernetworks data."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/hypernetworks")
+            response.raise_for_status()  # This will raise an exception for HTTP error responses
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching hypernetworks: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching hypernetworks: {e}") from e
 
     def get_face_restorers(self):
-        response = self.session.get(url=f"{self.baseurl}/face-restorers")
-        return response.json()
+        """Retrieve face restorers data."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/face-restorers")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching face restorers: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching face restorers: {e}") from e
 
     def get_realesrgan_models(self):
-        response = self.session.get(url=f"{self.baseurl}/realesrgan-models")
-        return response.json()
+        """Retrieve Real-ESRGAN models data."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/realesrgan-models")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching Real-ESRGAN models: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching Real-ESRGAN models: {e}") from e
 
     def get_prompt_styles(self):
-        response = self.session.get(url=f"{self.baseurl}/prompt-styles")
-        return response.json()
+        """Retrieve prompt styles."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/prompt-styles")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching prompt styles: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching prompt styles: {e}") from e
 
-    def get_artist_categories(self):  # deprecated ?
-        response = self.session.get(url=f"{self.baseurl}/artist-categories")
-        return response.json()
+    def get_artist_categories(self):
+        """Retrieve artist categories (potentially deprecated)."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/artist-categories")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching artist categories: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching artist categories: {e}") from e
 
-    def get_artists(self):  # deprecated ?
-        response = self.session.get(url=f"{self.baseurl}/artists")
-        return response.json()
-
+    def get_artists(self):
+        """Retrieve artists (potentially deprecated)."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/artists")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching artists: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching artists: {e}") from e
+    
+    
     def refresh_checkpoints(self):
-        response = self.session.post(url=f"{self.baseurl}/refresh-checkpoints")
-        return response.json()
+        """Refresh the model checkpoints."""
+        try:
+            response = self.session.post(url=f"{self.baseurl}/refresh-checkpoints")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while refreshing checkpoints: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while refreshing checkpoints: {e}") from e
 
     def get_scripts(self):
-        response = self.session.get(url=f"{self.baseurl}/scripts")
-        return response.json()
+        """Retrieve available scripts."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/scripts")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching scripts: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching scripts: {e}") from e
 
     def get_embeddings(self):
-        response = self.session.get(url=f"{self.baseurl}/embeddings")
-        return response.json()
+        """Retrieve embeddings data."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/embeddings")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching embeddings: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching embeddings: {e}") from e
 
     def get_memory(self):
-        response = self.session.get(url=f"{self.baseurl}/memory")
-        return response.json()
+        """Retrieve memory usage data."""
+        try:
+            response = self.session.get(url=f"{self.baseurl}/memory")
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while fetching memory data: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while fetching memory data: {e}") from e
 
+    # Utility Methods
     def get_endpoint(self, endpoint, baseurl):
+        """Construct the full URL for a given endpoint."""
+        # Note: This method does not involve network calls and thus doesn't require error handling
         if baseurl:
             return f"{self.baseurl}/{endpoint}"
         else:
             from urllib.parse import urlparse, urlunparse
-
             parsed_url = urlparse(self.baseurl)
             basehost = parsed_url.netloc
             parsed_url2 = (parsed_url[0], basehost, endpoint, "", "", "")
             return urlunparse(parsed_url2)
 
     def custom_get(self, endpoint, baseurl=False):
-        url = self.get_endpoint(endpoint, baseurl)
-        response = self.session.get(url=url)
-        return response.json()
-
+        """Custom GET request to an endpoint."""
+        try:
+            url = self.get_endpoint(endpoint, baseurl)
+            response = self.session.get(url=url)
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as e:
+            raise SystemError(f"HTTP Error while making custom GET request to {endpoint}: {e.response.status_code} - {e.response.reason}") from e
+        except Exception as e:
+            raise SystemError(f"An unexpected error occurred while making custom GET request to {endpoint}: {e}") from e
+    
     def custom_post(self, endpoint, payload={}, baseurl=False, use_async=False):
+        """Custom POST request to an endpoint with optional asynchronous execution."""
         url = self.get_endpoint(endpoint, baseurl)
         if use_async:
-            import asyncio
-
+            # Asynchronous execution path
             return asyncio.ensure_future(self.async_post(url=url, json=payload))
         else:
-            response = self.session.post(url=url, json=payload)
-            return self._to_api_result(response)
+            # Synchronous execution path
+            try:
+                response = self.session.post(url=url, json=payload)
+                response.raise_for_status()
+                return self._to_api_result(response)
+            except requests.HTTPError as e:
+                raise SystemError(f"HTTP Error while making POST request to {endpoint}: {e.response.status_code} - {e.response.reason}") from e
+            except Exception as e:
+                raise SystemError(f"An unexpected error occurred while making POST request to {endpoint}: {e}") from e
 
     def controlnet_version(self):
-        r = self.custom_get("controlnet/version")
-        return r["version"]
+        """Retrieve ControlNet version."""
+        try:
+            r = self.custom_get("controlnet/version")
+            return r["version"]
+        except KeyError:
+            raise ValueError("The response does not contain 'version' key.")
 
     def controlnet_model_list(self):
-        r = self.custom_get("controlnet/model_list")
-        return r["model_list"]
+        """Retrieve ControlNet model list."""
+        try:
+            r = self.custom_get("controlnet/model_list")
+            return r["model_list"]
+        except KeyError:
+            raise ValueError("The response does not contain 'model_list' key.")
 
     def controlnet_module_list(self):
-        r = self.custom_get("controlnet/module_list")
-        return r["module_list"]
+        """Retrieve ControlNet module list."""
+        try:
+            r = self.custom_get("controlnet/module_list")
+            return r["module_list"]
+        except KeyError:
+            raise ValueError("The response does not contain 'module_list' key.")
 
-    def controlnet_detect(
-        self, images, module="none", processor_res=512, threshold_a=64, threshold_b=64
-    ):
-        input_images = [b64_img(x) for x in images]
-        payload = {
-            "controlnet_module": module,
-            "controlnet_input_images": input_images,
-            "controlnet_processor_res": processor_res,
-            "controlnet_threshold_a": threshold_a,
-            "controlnet_threshold_b": threshold_b,
-        }
-        r = self.custom_post("controlnet/detect", payload=payload)
-        return r
+    def controlnet_detect(self, images, module="none", processor_res=512, threshold_a=64, threshold_b=64):
+        """Detect objects using ControlNet."""
+        try:
+            input_images = [self.b64_img(x) for x in images]
+            payload = {
+                "controlnet_module": module,
+                "controlnet_input_images": input_images,
+                "controlnet_processor_res": processor_res,
+                "controlnet_threshold_a": threshold_a,
+                "controlnet_threshold_b": threshold_b,
+            }
+            r = self.custom_post("controlnet/detect", payload=payload)
+            return r
+        except Exception as e:
+            raise SystemError(f"An error occurred during ControlNet detection: {e}")
 
     def util_get_model_names(self):
-        return sorted([x["title"] for x in self.get_sd_models()])
+        """Utility method to get sorted model names."""
+        try:
+            return sorted([x["title"] for x in self.get_sd_models()])
+        except KeyError:
+            raise ValueError("One or more models do not contain 'title' key.")
 
     def util_set_model(self, name, find_closest=True):
-        if find_closest:
-            name = name.lower()
-        models = self.util_get_model_names()
-        found_model = None
-        if name in models:
-            found_model = name
-        elif find_closest:
-            import difflib
+        """Set the model based on the name, with an option to find the closest match."""
+        try:
+            if find_closest:
+                name = name.lower()
+            models = self.util_get_model_names()
+            found_model = None
+            if name in models:
+                found_model = name
+            elif find_closest:
+                import difflib
 
-            def str_simularity(a, b):
-                return difflib.SequenceMatcher(None, a, b).ratio()
+                def str_similarity(a, b):
+                    return difflib.SequenceMatcher(None, a, b).ratio()
 
-            max_sim = 0.0
-            max_model = models[0]
-            for model in models:
-                sim = str_simularity(name, model)
-                if sim >= max_sim:
-                    max_sim = sim
-                    max_model = model
-            found_model = max_model
-        if found_model:
-            print(f"loading {found_model}")
-            options = {}
-            options["sd_model_checkpoint"] = found_model
-            self.set_options(options)
-            print(f"model changed to {found_model}")
-        else:
-            print("model not found")
+                max_sim = 0.0
+                max_model = models[0]
+                for model in models:
+                    sim = str_similarity(name, model.lower())
+                    if sim > max_sim:
+                        max_sim = sim
+                        max_model = model
+                found_model = max_model
+
+            if found_model:
+                print(f"Loading {found_model}...")
+                options = {"sd_model_checkpoint": found_model}
+                self.set_options(options)
+                print(f"Model changed to {found_model}.")
+            else:
+                print("Model not found.")
+        except Exception as e:
+            print(f"An error occurred while setting the model: {e}")
 
     def util_get_current_model(self):
-        options = self.get_options()
-        if ("sd_model_checkpoint" in options):
-            return options["sd_model_checkpoint"]
-        else:
-            sd_models = self.get_sd_models()
-            sd_model = [model for model in sd_models if model["sha256"] == options["sd_checkpoint_hash"]]
-            return sd_model[0]["title"]
-
+        """Retrieve the current model name based on the stored options."""
+        try:
+            options = self.get_options()
+            if "sd_model_checkpoint" in options:
+                return options["sd_model_checkpoint"]
+            else:
+                sd_models = self.get_sd_models()
+                if "sd_checkpoint_hash" in options:
+                    sd_model = next((model for model in sd_models if model["sha256"] == options["sd_checkpoint_hash"]), None)
+                    if sd_model:
+                        return sd_model["title"]
+                    else:
+                        print("Current model not found in the SD models list.")
+                else:
+                    print("Model information not available in current options.")
+        except Exception as e:
+            print(f"An error occurred while getting the current model: {e}")
+    
     def util_wait_for_ready(self, check_interval=5.0):
+        """Wait for the service to become ready by checking progress and job count."""
         import time
 
-        while True:
-            result = self.get_progress()
-            progress = result["progress"]
-            job_count = result["state"]["job_count"]
-            if progress == 0.0 and job_count == 0:
-                break
-            else:
-                print(f"[WAIT]: progress = {progress:.4f}, job_count = {job_count}")
-                time.sleep(check_interval)
-
+        try:
+            while True:
+                result = self.get_progress()
+                # Ensure 'progress' and 'state' are present in the response
+                if "progress" in result and "state" in result and "job_count" in result["state"]:
+                    progress = result["progress"]
+                    job_count = result["state"]["job_count"]
+                    if progress == 0.0 and job_count == 0:
+                        print("Service is ready.")
+                        break
+                    else:
+                        print(f"[WAIT]: progress = {progress:.4f}, job_count = {job_count}")
+                        time.sleep(check_interval)
+                else:
+                    raise ValueError("The response from 'get_progress' does not contain the expected keys ('progress', 'state', 'job_count').")
+        except requests.HTTPError as e:
+            print(f"HTTP Error while checking service readiness: {e.response.status_code} - {e.response.reason}")
+        except ValueError as e:
+            print(f"Data format error: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred while waiting for readiness: {e}")
 
 ## Interface for extensions
 
